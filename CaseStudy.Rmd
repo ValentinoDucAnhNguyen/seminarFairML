@@ -1,0 +1,126 @@
+---
+title: "Case study"
+author: "Duc-Anh Nguyen"
+date: "2024-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries used
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+library(caret)
+library(glmnet)
+library(ranger)
+library(gbm)
+
+library(DALEX)
+
+library(fairness)
+library(fairmodels)
+library(mlr3)
+library(mlr3fairness)
+library(mlr3learners)
+library(mlr3tuning)
+library(fairml)
+```
+
+```{r}
+data("compas", package = "mlr3fairness")
+str(compas)
+head(compas)
+
+```
+
+```{r fairness}
+df <- compas
+
+# partitioning params
+set.seed(77)
+val_percent <- 0.3
+val_idx     <- sample(1:nrow(df))[1:round(nrow(df) * val_percent)]
+
+# partition the data
+df_train <- df[-val_idx, ]
+df_valid <- df[ val_idx, ]
+
+# check dim
+print(nrow(df_train))
+print(nrow(df_valid))
+
+# fit logit models
+model1 <- glm(two_year_recid ~ .,            
+              data   = df_train, 
+              family = binomial(link = 'logit'))
+model2 <- glm(two_year_recid ~ . -race                   , 
+              data   = df_train, 
+              family = binomial(link = 'logit'))
+# produce predictions
+df_valid$prob_1 <- predict(model1, df_valid, type = 'response')
+df_valid$prob_2 <- predict(model2, df_valid, type = 'response')
+head(df_valid)
+
+df_valid$two_year_recid %>% str()
+res1 <- pred_rate_parity(data         = df_valid, 
+                         outcome      = 'two_year_recid', 
+                         outcome_base = '0', 
+                         group        = 'race',
+                         probs        = 'prob_1', 
+                         cutoff       = 0.5, 
+                         base         = 'Caucasian')
+res1$Metric
+res1$Metric_plot
+res1$Probability_plot
+```
+```{r fairmodels}
+compas$two_year_recid <- as.factor(ifelse(compas$two_year_recid == '1', '0', '1'))
+compas$two_year_recid %>% str()
+# train
+rf_compas <- ranger(two_year_recid ~., data = compas, probability = TRUE)
+
+# numeric target values
+y_numeric <- as.numeric(compas$two_year_recid)-1
+
+# explainer
+rf_explainer <- explain(rf_compas, data = compas[,-1], y = y_numeric, colorize = FALSE)
+
+fobject <- fairness_check(rf_explainer,                         # explainer
+                          protected = compas$race,         # protected variable as factor
+                          privileged = "Caucasian",             # level in protected variable, potentially more privileged
+                          cutoff = 0.5,                         # cutoff - optional, default = 0.5
+                          colorize = FALSE)  
+print(fobject, colorize = FALSE)
+plot(fobject)
+plot_density(fobject)
+plot(metric_scores(fobject))
+
+# fit logit models, but with all df
+glm1 <- glm(two_year_recid ~ .,            
+              data   = compas, 
+              family = binomial(link = 'logit'))
+glm2 <- glm(two_year_recid ~ . -race                   , 
+              data   = compas, 
+              family = binomial(link = 'logit'))
+
+glm_explainer_1 <- explain(glm1,  data = compas[,-1], y = y_numeric)
+glm_explainer_2 <- explain(glm2,  data = compas[,-1], y = y_numeric)
+fobject <- fairness_check(glm_explainer_1, glm_explainer_2, rf_explainer, protected = compas$race, privileged = "Caucasian", verbose = FALSE) 
+
+lr_compas_1 <- glm(Two_yr_Recidivism~.,
+                   data=compas,
+                   family=binomial(link="logit"))
+
+```
+
+
+```{r}
+data("compas", package = "mlr3fairness")
+str(compas)
+head(compas)
+```
