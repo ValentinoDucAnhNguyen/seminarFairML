@@ -1,7 +1,7 @@
 ---
-title: "Case study"
+title: "FairML: Software Packages in R: some examples"
 author: "Duc-Anh Nguyen"
-date: "2024-02-18"
+date: "2024-02-25"
 output: html_document
 ---
 
@@ -9,7 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## Libraries used
+### Libraries used
 ```{r}
 library(dplyr)
 library(tidyr)
@@ -29,98 +29,183 @@ library(mlr3fairness)
 library(mlr3learners)
 library(mlr3tuning)
 library(fairml)
+library(mlr3pipelines)
 ```
 
-```{r}
-data("compas", package = "mlr3fairness")
-str(compas)
-head(compas)
 
+
+
+# mlr3fairness
+
+
+Here we start with using mlr3fairness and other related packages in the mlr3 family
+to train firstly a random forest model. Then we apply a debiasing method namely reweighting.
+This technique generates weights from the dataset, which are then utilized by the model during training to address potential biases. Since the dataset may contain multiple subgroups, the generated weights are provided as a vector, guiding the model on aspects to be cautious about.
+
+
+```{r mlr3fairness}
+set.seed(84)
+task <- tsk("compas")
+# train a random forest model
+learner = lrn("classif.rpart", cp = 0.005)
+# debiasing with reweighting
+learner_rw = as_learner(po("reweighing_wts") %>>% learner)
+# Here we combine the PipeOp with a Learner to automate the preprocessing. 
+# Then we run a small benchmark
+grd = benchmark_grid(list(task), list(learner, learner_rw), rsmp("cv", folds=3))
+bmr = benchmark(grd)
+bmr$aggregate(msrs(c("fairness.tpr", "fairness.acc")))
 ```
 
-```{r fairness}
-df <- compas
 
-# partitioning params
-set.seed(77)
-val_percent <- 0.3
-val_idx     <- sample(1:nrow(df))[1:round(nrow(df) * val_percent)]
+The results show no difference between the two approaches. This might mean that our
+data is not unbalanced, and we need to try other approaches to enhance fairness in model.
 
-# partition the data
-df_train <- df[-val_idx, ]
-df_valid <- df[ val_idx, ]
 
-# check dim
-print(nrow(df_train))
-print(nrow(df_valid))
+
+
+
+# fairmodels
+
+Move onto the second package fairmodels, we will use the same data as above, then train
+another random forest with the package ranger. Then with the same idea above, we try
+to mitigate bias by appplying again the method of reweighting.
+
+
+```{r fairmodels}
+set.seed(84)
+# using the same data as above
+df <- task$data() 
+# the data compas from mlr3fairness also has this is_recid variable, which show if 
+# one ever commit recidivism (compared to two_year_recid, which only considered the
+# next two year after crime). Here we do not need it for the modeling.
+df <- select(df, -is_recid)
+# Using fairmodels we need to define the protected attribute for the assessing
+protected <- df$race
+
+# we apply reweight, a built-in method in the package
+weights <- reweight(protected = protected, y = as.numeric(df$two_year_recid) - 1) 
+# training random forest
+rf_compas <- ranger(two_year_recid ~., data = df, probability = TRUE)
+y_numeric <- as.numeric(df$two_year_recid) - 1
+# based on DALEX, here we need to create an explainer
+rf_explainer <- explain(rf_compas, data = df[,-1], y = y_numeric, colorize = FALSE)
+# then we can use funciton fairness_check, which help quickly check bias with with 
+# some of the most popular fairness metrics (group fairness)
+fobject <- fairness_check(rf_explainer,   # explainer
+                          protected = df$race, # protected variable as factor
+                          privileged = "Caucasian", #level in protected variable, potentially more privileged
+                          cutoff = 0.5,    # cutoff - optional, default = 0.5
+                          colorize = FALSE)    
+# debiasing with reweighting, here we rebuild another random forest
+rf_compas_w <- ranger(two_year_recid ~., data = df, case.weights = weights, probability = TRUE)
+rf_explainer_w <- explain(rf_compas_w,
+                           data = df[,-1],
+                           y = y_numeric,
+                           label = "rf_weighted",
+                           verbose = FALSE)
+fobject <- fairness_check(fobject, rf_explainer_w, verbose = FALSE)
+# now we can compare the two models
+print(fobject, colorize = FALSE)
+plot(fobject)
+```
+
+The ranger model frequently exceeds established fairness thresholds, which can be adjusted using the epsilon parameter. Visual indicators, such as bars reaching into the left red zone, denote bias against particular unprivileged subgroups. 
+
+On the other hand, bars extending into the right red zone indicate bias favoring privileged subgroups, with the Caucasian group often serving as the baseline (marked as 1) in all metrics. 
+
+These metrics express the ratios between unprivileged and privileged subgroups (e.g., African American to Caucasian). By default, they follow the 80% rule stipulated by the Code of Federal Regulations (1978), which, for instance, implies that women should be granted credit at a minimum rate of 80% relative to men. This framework aims to measure the fairness of treatment and mistreatment among various subgroups.
+
+With the plot we could see that the equal opportunity ratio is getting fairer in
+the reweighted model.
+
+
+
+
+
+# fairml
+
+
+Here we showcase how to learn a basic model provided in the package fairml: FGRRM (fair generalized ridge regression model). We also fit a logistic regression model to compare.
+
+
+```{r fairml}
+data("compas", package = "fairml")
+# extracting the response variable (r), the sensitive attributes (s) and the predictors (p)
+r = compas[, "two_year_recid"]
+s = compas[, c("sex", "race")]
+p = compas[, setdiff(names(compas), c("two_year_recid", "sex", "race"))]
+
+# fgrrm() is the extension of frrm() to generalized linear models, currently implementing linear
+# (family = "gaussian") and logistic (family = "binomial") regressions. fgrrm() is equivalent to
+# frrm() with family = "gaussian". 
+
+# Notice: The definition of fairness are identical between frrm() and fgrrm(),
+# by default sp-komiyama (statistical parity). Other options: "eo-komiyama" (Equalised Odds)
+# or "if-berk" (Individual fairness). 
+m =  fgrrm(response = r, sensitive = s, predictors = p,  family = "binomial", unfairness = 0.05)
+summary(m)
+# m = nclm(response = r, sensitive = s, predictors = p, unfairness = 0.05)
+# summary(m)
+# m = frrm(response = r, sensitive = s, predictors = p, unfairness = 0.05)
+# summary(m)
+
+# Is this model a good fit for the data? The diagnostic plots generated by
+plot(m, support = TRUE)
+
+# The package fairml apparently also offers function for visualising fairness in 
+# its own way.
+fairness.profile.plot(response = r, sensitive = s, predictors = p, model = "fgrrm", 
+                      type = "coefficients", model.args = list(family = "binomial"))
 
 # fit logit models
-model1 <- glm(two_year_recid ~ .,            
-              data   = df_train, 
+model <- glm(two_year_recid ~ .,            
+              data   = compas, 
               family = binomial(link = 'logit'))
-model2 <- glm(two_year_recid ~ . -race                   , 
-              data   = df_train, 
-              family = binomial(link = 'logit'))
-# produce predictions
-df_valid$prob_1 <- predict(model1, df_valid, type = 'response')
-df_valid$prob_2 <- predict(model2, df_valid, type = 'response')
-head(df_valid)
+```
 
-df_valid$two_year_recid %>% str()
-res1 <- pred_rate_parity(data         = df_valid, 
+
+The profile plots created by function fairness.profile.plot() for regression coefficients as a function of the fairness constraint across all levels of the response variable provide a visual exploration of how introducing fairness considerations into a model affects its parameters. These plots are particularly useful in regression analysis when one want to understand the impact of enforcing fairness constraints on the estimated coefficients for different groups or outcomes in their model.
+
+
+
+
+# fairness
+Focuses on measuring and visualising one fairness metric at a time, the package fairness
+will be used now to illustrate the performance of the two models trained with the package 
+fairml above.
+```{r fairness}
+compas$prob_1 <- predict(m, new.predictors = p, new.sensitive = s, type = "response")
+compas$prob_2 <- predict(model, compas, type = 'response')
+
+# Here we choose predictive rate parity as the fairness metric to be compared
+res1 <- pred_rate_parity(data         = compas, 
                          outcome      = 'two_year_recid', 
-                         outcome_base = '0', 
+                         outcome_base = 'No', 
                          group        = 'race',
                          probs        = 'prob_1', 
                          cutoff       = 0.5, 
                          base         = 'Caucasian')
 res1$Metric
 res1$Metric_plot
-res1$Probability_plot
-```
-```{r fairmodels}
-compas$two_year_recid <- as.factor(ifelse(compas$two_year_recid == '1', '0', '1'))
-compas$two_year_recid %>% str()
-# train
-rf_compas <- ranger(two_year_recid ~., data = compas, probability = TRUE)
-
-# numeric target values
-y_numeric <- as.numeric(compas$two_year_recid)-1
-
-# explainer
-rf_explainer <- explain(rf_compas, data = compas[,-1], y = y_numeric, colorize = FALSE)
-
-fobject <- fairness_check(rf_explainer,                         # explainer
-                          protected = compas$race,         # protected variable as factor
-                          privileged = "Caucasian",             # level in protected variable, potentially more privileged
-                          cutoff = 0.5,                         # cutoff - optional, default = 0.5
-                          colorize = FALSE)  
-print(fobject, colorize = FALSE)
-plot(fobject)
-plot_density(fobject)
-plot(metric_scores(fobject))
-
-# fit logit models, but with all df
-glm1 <- glm(two_year_recid ~ .,            
-              data   = compas, 
-              family = binomial(link = 'logit'))
-glm2 <- glm(two_year_recid ~ . -race                   , 
-              data   = compas, 
-              family = binomial(link = 'logit'))
-
-glm_explainer_1 <- explain(glm1,  data = compas[,-1], y = y_numeric)
-glm_explainer_2 <- explain(glm2,  data = compas[,-1], y = y_numeric)
-fobject <- fairness_check(glm_explainer_1, glm_explainer_2, rf_explainer, protected = compas$race, privileged = "Caucasian", verbose = FALSE) 
-
-lr_compas_1 <- glm(Two_yr_Recidivism~.,
-                   data=compas,
-                   family=binomial(link="logit"))
-
+res2 <- pred_rate_parity(data         = compas, 
+                         outcome      = 'two_year_recid', 
+                         outcome_base = 'No', 
+                         group        = 'race',
+                         probs        = 'prob_2', 
+                         cutoff       = 0.5, 
+                         base         = 'Caucasian')
+res2$Metric
+res2$Metric_plot
 ```
 
 
-```{r}
-data("compas", package = "mlr3fairness")
-str(compas)
-head(compas)
-```
+In an ideal scenario, predictive rate parities would all be equal to one, signifying that the precision across all groups matches that of the base group. 
+
+In reality, however, these values tend to vary. A parity greater than one suggests that the precision within a particular group is comparatively higher than in the base group, while a parity less than one indicates reduced precision. 
+
+Significant variations in these parity values serve as an indicator that the model's performance is not uniform across different groups, pointing to potential biases in how the model processes and predicts outcomes for diverse subsets of data. This variability underscores the importance of examining and adjusting model parameters or employing fairness-enhancing techniques to ensure equitable model performance across all groups.
+
+With the first plot showing the predictive rate parity accross all subgroups, trained 
+by the model from fairml and the second with the logistic regression model, one can 
+say that the first model is way fairer (in terms of predictive rate parity).
